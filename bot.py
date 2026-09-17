@@ -1,5 +1,6 @@
 import os
 import asyncio
+import json
 import logging
 from datetime import datetime
 
@@ -7,18 +8,14 @@ import whisper
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
 from aiogram.types import FSInputFile
-from aiogram.client.session.aiohttp import AiohttpSession
-import aiohttp
 
 # ============================================================
 # НАСТРОЙКИ
 # ============================================================
-API_TOKEN = ""
+API_TOKEN = "НОВЫЙ_ТОКЕН_ОТ_BOTFATHER"
 
-# Прокси не используем (убираем, чтобы не было ошибок)
-PROXY_URL = None
 
-WHISPER_MODEL = "small"
+WHISPER_MODEL = "base"  # ИЗМЕНЕНО: можно поставить "medium" для лучшего качества
 DOWNLOADS_DIR = "bot_downloads"
 RESULTS_DIR = "bot_results"
 
@@ -33,8 +30,14 @@ model = whisper.load_model(WHISPER_MODEL)
 print("Модель загружена!")
 
 def transcribe_audio(file_path: str):
-    result = model.transcribe(file_path, language="ru", verbose=False)
+    result = model.transcribe(
+        file_path,
+        language="ru",
+        verbose=False,
+        initial_prompt="Бот, ты тут? Бот, ответь. Эй, бот, слушай меня. Бот, привет. Бот, ты работаете?",
+    )
     return result
+
 
 def format_timestamp(seconds: float) -> str:
     hours = int(seconds // 3600)
@@ -52,15 +55,19 @@ def generate_srt(segments: list) -> str:
         lines.append(f"{i}\n{start} --> {end}\n{text}\n")
     return "\n".join(lines)
 
-# Создаём сессию (без прокси и без IPv4-костылей)
-if PROXY_URL:
-    logger.info(f"Используем прокси: {PROXY_URL}")
-    session = AiohttpSession(proxy=PROXY_URL, timeout=aiohttp.ClientTimeout(total=60))
-else:
-    logger.info("Прямое соединение (без прокси)")
-    session = AiohttpSession(timeout=aiohttp.ClientTimeout(total=60))
+def generate_json(segments: list) -> str:
+    # ИЗМЕНЕНО: добавлена функция генерации JSON с таймингами сегментов
+    clean_segments = []
+    for seg in segments:
+        clean_segments.append({
+            "id": seg["id"],
+            "start": round(seg["start"], 3),
+            "end": round(seg["end"], 3),
+            "text": seg["text"].strip(),
+        })
+    return json.dumps(clean_segments, ensure_ascii=False, indent=2)
 
-bot = Bot(token=API_TOKEN, session=session)
+bot = Bot(token=API_TOKEN)
 dp = Dispatcher()
 
 @dp.message(Command("start"))
@@ -70,7 +77,8 @@ async def cmd_start(message: types.Message):
         "Отправь мне голосовое сообщение или аудиофайл (mp3, m4a, wav).\n"
         "Я верну тебе:\n"
         "— Текст (.txt)\n"
-        "— Субтитры (.srt)\n\n"
+        "— Субтитры (.srt)\n"
+        "— Тайминги сегментов (.json)\n\n"
         "Лимит: 20 МБ, язык: русский."
     )
 
@@ -142,6 +150,7 @@ async def handle_audio(message: types.Message):
     base_name = timestamp_str
     txt_path = f"{RESULTS_DIR}/{base_name}.txt"
     srt_path = f"{RESULTS_DIR}/{base_name}.srt"
+    json_path = f"{RESULTS_DIR}/{base_name}.json"  # ИЗМЕНЕНО: путь для JSON
 
     with open(txt_path, "w", encoding="utf-8") as f:
         f.write(text)
@@ -150,6 +159,11 @@ async def handle_audio(message: types.Message):
         srt_content = generate_srt(segments)
         with open(srt_path, "w", encoding="utf-8") as f:
             f.write(srt_content)
+
+        # ИЗМЕНЕНО: сохраняем JSON с таймингами
+        json_content = generate_json(segments)
+        with open(json_path, "w", encoding="utf-8") as f:
+            f.write(json_content)
 
     await message.answer(f"✅ Готово! Распознано символов: {len(text)}")
 
@@ -168,6 +182,13 @@ async def handle_audio(message: types.Message):
             caption="Субтитры (.srt) — можно вставлять в CapCut"
         )
 
+    # ИЗМЕНЕНО: отправляем JSON с таймингами
+    if segments and os.path.exists(json_path):
+        await message.answer_document(
+            document=FSInputFile(json_path),
+            caption="Тайминги сегментов (.json)"
+        )
+
     _cleanup(local_filename)
     logger.info(f"Готово: {base_name}")
 
@@ -181,23 +202,9 @@ def _cleanup(*paths):
 
 async def main():
     logger.info("Бот запускается...")
-    max_retries = 5
-    retry_delay = 5
-
-    for attempt in range(1, max_retries + 1):
-        try:
-            logger.info(f"Попытка соединения с Telegram ({attempt}/{max_retries})")
-            me = await bot.get_me()
-            logger.info(f"Соединение установлено! Бот: @{me.username}")
-            await dp.start_polling(bot)
-            break
-        except Exception as e:
-            logger.warning(f"Ошибка ({attempt}/{max_retries}): {e}")
-            if attempt == max_retries:
-                logger.error("Все попытки исчерпаны. Проверь токен и интернет.")
-                raise
-            logger.info(f"Ждём {retry_delay} сек...")
-            await asyncio.sleep(retry_delay)
+    me = await bot.get_me()
+    logger.info(f"Бот: @{me.username}")
+    await dp.start_polling(bot)
 
 if __name__ == "__main__":
     asyncio.run(main())
