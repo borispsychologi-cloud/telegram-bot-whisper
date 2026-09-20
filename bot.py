@@ -4,18 +4,26 @@ import json
 import logging
 from datetime import datetime
 
-import whisper
+#import whisper
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
 from aiogram.types import FSInputFile
+from dotenv import load_dotenv  # <--- ВАЖНО: импорт для работы с .env
 
 # ============================================================
-# НАСТРОЙКИ
+# НАСТРОЙКИ И БЕЗОПАСНОСТЬ
 # ============================================================
-API_TOKEN = "НОВЫЙ_ТОКЕН_ОТ_BOTFATHER"
 
+# Загружаем переменные из файла .env
+load_dotenv()
 
-WHISPER_MODEL = "base"  # ИЗМЕНЕНО: можно поставить "medium" для лучшего качества
+# Получаем токен. Если в .env нет TELEGRAM_TOKEN, будет None
+API_TOKEN = os.getenv("TELEGRAM_TOKEN")
+
+if not API_TOKEN:
+    raise ValueError("Ошибка: Токен не найден! Проверьте файл .env и наличие строки TELEGRAM_TOKEN=...")
+
+#WHISPER_MODEL = "base"  # Можно поставить "small" или "medium" (требует больше памяти)
 DOWNLOADS_DIR = "bot_downloads"
 RESULTS_DIR = "bot_results"
 
@@ -26,18 +34,27 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 logger = logging.getLogger(__name__)
 
 print("Загружаю модель Whisper... Это может занять минуту.")
-model = whisper.load_model(WHISPER_MODEL)
+#model = whisper.load_model(WHISPER_MODEL)
 print("Модель загружена!")
 
+# Вспомогательная функция очистки (должна быть объявлена ДО использования в хендлерах)
+def _cleanup(*paths):
+    for p in paths:
+        if os.path.exists(p):
+            try:
+                os.remove(p)
+                logger.debug(f"Удален временный файл: {p}")
+            except Exception as e:
+                logger.error(f"Не удалось удалить файл {p}: {e}")
+
 def transcribe_audio(file_path: str):
+    # Убрали initial_prompt — он ухудшал качество для обычной речи
     result = model.transcribe(
         file_path,
         language="ru",
         verbose=False,
-        initial_prompt="Бот, ты тут? Бот, ответь. Эй, бот, слушай меня. Бот, привет. Бот, ты работаете?",
     )
     return result
-
 
 def format_timestamp(seconds: float) -> str:
     hours = int(seconds // 3600)
@@ -56,11 +73,10 @@ def generate_srt(segments: list) -> str:
     return "\n".join(lines)
 
 def generate_json(segments: list) -> str:
-    # ИЗМЕНЕНО: добавлена функция генерации JSON с таймингами сегментов
     clean_segments = []
     for seg in segments:
         clean_segments.append({
-            "id": seg["id"],
+            "id": seg.get("id", len(clean_segments)),
             "start": round(seg["start"], 3),
             "end": round(seg["end"], 3),
             "text": seg["text"].strip(),
@@ -132,6 +148,7 @@ async def handle_audio(message: types.Message):
     await message.answer("⏳ Расшифровываю… Подожди, это займёт время.")
 
     try:
+        # Запускаем тяжелую задачу в отдельном потоке, чтобы не блокировать бота
         result = await asyncio.to_thread(transcribe_audio, local_filename)
     except Exception as e:
         logger.error(f"Ошибка транскрибации: {e}")
@@ -150,7 +167,7 @@ async def handle_audio(message: types.Message):
     base_name = timestamp_str
     txt_path = f"{RESULTS_DIR}/{base_name}.txt"
     srt_path = f"{RESULTS_DIR}/{base_name}.srt"
-    json_path = f"{RESULTS_DIR}/{base_name}.json"  # ИЗМЕНЕНО: путь для JSON
+    json_path = f"{RESULTS_DIR}/{base_name}.json"
 
     with open(txt_path, "w", encoding="utf-8") as f:
         f.write(text)
@@ -160,7 +177,6 @@ async def handle_audio(message: types.Message):
         with open(srt_path, "w", encoding="utf-8") as f:
             f.write(srt_content)
 
-        # ИЗМЕНЕНО: сохраняем JSON с таймингами
         json_content = generate_json(segments)
         with open(json_path, "w", encoding="utf-8") as f:
             f.write(json_content)
@@ -182,7 +198,6 @@ async def handle_audio(message: types.Message):
             caption="Субтитры (.srt) — можно вставлять в CapCut"
         )
 
-    # ИЗМЕНЕНО: отправляем JSON с таймингами
     if segments and os.path.exists(json_path):
         await message.answer_document(
             document=FSInputFile(json_path),
@@ -192,19 +207,14 @@ async def handle_audio(message: types.Message):
     _cleanup(local_filename)
     logger.info(f"Готово: {base_name}")
 
-def _cleanup(*paths):
-    for p in paths:
-        if os.path.exists(p):
-            try:
-                os.remove(p)
-            except Exception:
-                pass
-
 async def main():
     logger.info("Бот запускается...")
-    me = await bot.get_me()
-    logger.info(f"Бот: @{me.username}")
-    await dp.start_polling(bot)
+    try:
+        me = await bot.get_me()
+        logger.info(f"Бот: @{me.username}")
+        await dp.start_polling(bot)
+    except Exception as e:
+        logger.critical(f"Критическая ошибка запуска: {e}")
 
 if __name__ == "__main__":
     asyncio.run(main())
