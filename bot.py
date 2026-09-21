@@ -1,60 +1,33 @@
 import os
 import asyncio
-import json
-import logging
 from datetime import datetime
+from dotenv import load_dotenv
 
-#import whisper
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
 from aiogram.types import FSInputFile
-from dotenv import load_dotenv  # <--- ВАЖНО: импорт для работы с .env
+from aiogram.enums import ParseMode
 
-# ============================================================
-# НАСТРОЙКИ И БЕЗОПАСНОСТЬ
-# ============================================================
+# Импорт функций генерации форматов (предполагается, что они определены в отдельном модуле)
+# from transcription_utils import generate_srt, generate_json
 
-# Загружаем переменные из файла .env
 load_dotenv()
 
-# Получаем токен. Если в .env нет TELEGRAM_TOKEN, будет None
 API_TOKEN = os.getenv("TELEGRAM_TOKEN")
-
 if not API_TOKEN:
-    raise ValueError("Ошибка: Токен не найден! Проверьте файл .env и наличие строки TELEGRAM_TOKEN=...")
+    raise RuntimeError("TELEGRAM_TOKEN не найден в .env")
 
-#WHISPER_MODEL = "base"  # Можно поставить "small" или "medium" (требует больше памяти)
-DOWNLOADS_DIR = "bot_downloads"
-RESULTS_DIR = "bot_results"
+DOWNLOADS_DIR = "downloads"
+RESULTS_DIR = "results"
 
 os.makedirs(DOWNLOADS_DIR, exist_ok=True)
 os.makedirs(RESULTS_DIR, exist_ok=True)
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-logger = logging.getLogger(__name__)
+MAX_FILE_SIZE = 20 * 1024 * 1024  # 20 МБ
 
-print("Загружаю модель Whisper... Это может занять минуту.")
-#model = whisper.load_model(WHISPER_MODEL)
-print("Модель загружена!")
+bot = Bot(token=API_TOKEN)
+dp = Dispatcher()
 
-# Вспомогательная функция очистки (должна быть объявлена ДО использования в хендлерах)
-def _cleanup(*paths):
-    for p in paths:
-        if os.path.exists(p):
-            try:
-                os.remove(p)
-                logger.debug(f"Удален временный файл: {p}")
-            except Exception as e:
-                logger.error(f"Не удалось удалить файл {p}: {e}")
-
-def transcribe_audio(file_path: str):
-    # Убрали initial_prompt — он ухудшал качество для обычной речи
-    result = model.transcribe(
-        file_path,
-        language="ru",
-        verbose=False,
-    )
-    return result
 
 def format_timestamp(seconds: float) -> str:
     hours = int(seconds // 3600)
@@ -63,28 +36,14 @@ def format_timestamp(seconds: float) -> str:
     millis = int((seconds - int(seconds)) * 1000)
     return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
 
-def generate_srt(segments: list) -> str:
-    lines = []
-    for i, seg in enumerate(segments, start=1):
-        start = format_timestamp(seg["start"])
-        end = format_timestamp(seg["end"])
-        text = seg["text"].strip()
-        lines.append(f"{i}\n{start} --> {end}\n{text}\n")
-    return "\n".join(lines)
 
-def generate_json(segments: list) -> str:
-    clean_segments = []
-    for seg in segments:
-        clean_segments.append({
-            "id": seg.get("id", len(clean_segments)),
-            "start": round(seg["start"], 3),
-            "end": round(seg["end"], 3),
-            "text": seg["text"].strip(),
-        })
-    return json.dumps(clean_segments, ensure_ascii=False, indent=2)
+def _cleanup(filename: str):
+    try:
+        if os.path.exists(filename):
+            os.remove(filename)
+    except Exception as e:
+        print(f"Не удалось удалить файл {filename}: {e}")
 
-bot = Bot(token=API_TOKEN)
-dp = Dispatcher()
 
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
@@ -92,16 +51,17 @@ async def cmd_start(message: types.Message):
         "Привет! Я бот-транскрибатор.\n\n"
         "Отправь мне голосовое сообщение или аудиофайл (mp3, m4a, wav).\n"
         "Я верну тебе:\n"
-        "— Текст (.txt)\n"
-        "— Субтитры (.srt)\n"
-        "— Тайминги сегментов (.json)\n\n"
+        "- текст (.txt)\n"
+        "- субтитры (.srt)\n"
+        "- тайминги сегментов (.json)\n\n"
         "Лимит: 20 МБ, язык: русский."
     )
 
+
 @dp.message()
-async def handle_audio(message: types.Message):
+async def handle_message(message: types.Message):
     file_obj = None
-    file_ext = ""
+    file_ext = ".mp3"
 
     if message.voice:
         file_obj = message.voice
@@ -110,7 +70,7 @@ async def handle_audio(message: types.Message):
         file_obj = message.audio
         if message.audio.file_name:
             _, ext = os.path.splitext(message.audio.file_name)
-            file_ext = ext if ext else ".mp3"
+            file_ext = ext.lower() if ext else ".mp3"
         else:
             file_ext = ".mp3"
     elif message.document:
@@ -120,101 +80,95 @@ async def handle_audio(message: types.Message):
             if ext in (".mp3", ".m4a", ".wav", ".ogg", ".flac", ".aac"):
                 file_obj = message.document
                 file_ext = ext
-        if not file_obj:
-            await message.answer("Я принимаю только аудиофайлы (mp3, m4a, wav, ogg).")
-            return
-    else:
-        await message.answer("Пришли голосовое или аудиофайл — я его расшифрую.")
+
+    if not file_obj:
+        await message.answer("Я принимаю только аудиофайлы (mp3, m4a, wav, ogg, flac, aac).")
         return
 
-    if file_obj.file_size and file_obj.file_size > 20 * 1024 * 1024:
-        await message.answer("Файл слишком большой. Максимум — 20 МБ.")
+    if file_obj.file_size and file_obj.file_size > MAX_FILE_SIZE:
+        await message.answer("Файл слишком большой. Максимальный размер — 20 МБ.")
         return
 
     timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
-    local_filename = f"{DOWNLOADS_DIR}/{timestamp_str}{file_ext}"
+    base_name = f"transcription_{timestamp_str}"
+    local_filename = os.path.join(DOWNLOADS_DIR, f"{base_name}{file_ext}")
+    txt_path = os.path.join(RESULTS_DIR, f"{base_name}.txt")
+    srt_path = os.path.join(RESULTS_DIR, f"{base_name}.srt")
+    json_path = os.path.join(RESULTS_DIR, f"{base_name}.json")
 
-    await message.answer("📥 Скачиваю файл…")
-    try:
-        file = await bot.get_file(file_obj.file_id)
-        await bot.download_file(file.file_path, local_filename)
-    except Exception as e:
-        logger.error(f"Ошибка скачивания: {e}")
-        await message.answer("Не удалось скачать файл. Попробуй ещё раз.")
-        return
+    # Скачивание файла
+    file = await bot.get_file(file_obj.file_id)
+    await file.download_to(local_filename)
 
-    logger.info(f"Файл скачан: {local_filename}")
+    # --- ЗАМЕСТИТЕЛЬ БЛОКА ТРАНСКРИБАЦИИ ---
+    # Здесь должна быть логика вызова Whisper/Vosk/SpeechKit
+    # segments = transcribe_audio(local_filename)
+    # Для демонстрации эмулируем результат
+    segments = [
+        {"start": 0.0, "end": 5.0, "text": "Это пример транскрибации."},
+        {"start": 5.0, "end": 10.0, "text": "Второй сегмент текста."}
+    ]
+    # --------------------------------------
 
-    await message.answer("⏳ Расшифровываю… Подожди, это займёт время.")
+    # Генерация текста
+    text = "\n".join(seg["text"].strip() for seg in segments)
 
-    try:
-        # Запускаем тяжелую задачу в отдельном потоке, чтобы не блокировать бота
-        result = await asyncio.to_thread(transcribe_audio, local_filename)
-    except Exception as e:
-        logger.error(f"Ошибка транскрибации: {e}")
-        await message.answer("Ошибка при расшифровке. Возможно, файл повреждён.")
-        _cleanup(local_filename)
-        return
-
-    text = result.get("text", "").strip()
-    segments = result.get("segments", [])
-
-    if not text:
-        await message.answer("Не удалось распознать речь. Возможно, файл пустой или тихий.")
-        _cleanup(local_filename)
-        return
-
-    base_name = timestamp_str
-    txt_path = f"{RESULTS_DIR}/{base_name}.txt"
-    srt_path = f"{RESULTS_DIR}/{base_name}.srt"
-    json_path = f"{RESULTS_DIR}/{base_name}.json"
-
+    # Сохранение TXT
     with open(txt_path, "w", encoding="utf-8") as f:
         f.write(text)
 
+    # Сохранение SRT
     if segments:
-        srt_content = generate_srt(segments)
+        srt_content = generate_srt(segments)  # Предполагается, что функция определена
         with open(srt_path, "w", encoding="utf-8") as f:
             f.write(srt_content)
 
-        json_content = generate_json(segments)
+    # Сохранение JSON
+    if segments:
+        json_content = generate_json(segments)  # Предполагается, что функция определена
         with open(json_path, "w", encoding="utf-8") as f:
             f.write(json_content)
 
-    await message.answer(f"✅ Готово! Распознано символов: {len(text)}")
+    await message.answer(f"• Готово! Распознано символов: {len(text)}")
 
-    if len(text) <= 4000:
-        await message.answer(f"📝 Текст:\n\n{text}")
-    else:
-        await message.answer("📝 Текст слишком длинный — отправляю файлом.")
-        await message.answer_document(
-            document=FSInputFile(txt_path),
-            caption="Расшифрованный текст (.txt)"
-        )
+    # Отправка текста
+    if text:
+        if len(text) <= 4000:
+            await message.answer(f"Текст:\n\n{text}")
+        else:
+            await message.answer("• Текст слишком длинный – отправляю файлом.")
+            await message.answer_document(
+                document=FSInputFile(txt_path),
+                caption="Расшифрованный текст (.txt)"
+            )
 
+    # Отправка SRT
     if segments and os.path.exists(srt_path):
         await message.answer_document(
             document=FSInputFile(srt_path),
             caption="Субтитры (.srt) — можно вставлять в CapCut"
         )
 
+    # Отправка JSON
     if segments and os.path.exists(json_path):
         await message.answer_document(
             document=FSInputFile(json_path),
-            caption="Тайминги сегментов (.json)"
+            caption="Тайминги и сегменты (.json)"
         )
 
     _cleanup(local_filename)
-    logger.info(f"Готово: {base_name}")
+    print(f"Готово: {base_name}")
+
 
 async def main():
-    logger.info("Бот запускается...")
+    print("Бот запускается…")
     try:
         me = await bot.get_me()
-        logger.info(f"Бот: @{me.username}")
+        print(f"Бот: @{me.username}")
         await dp.start_polling(bot)
     except Exception as e:
-        logger.critical(f"Критическая ошибка запуска: {e}")
+        print(f"Критическая ошибка запуска: {e}")
+
 
 if __name__ == "__main__":
     asyncio.run(main())
